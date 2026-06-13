@@ -8,6 +8,8 @@ wheels/
 
 test.py
 pokemon-showdown/
+replays/
+results/
 
 # Virtual environments
 .venv
