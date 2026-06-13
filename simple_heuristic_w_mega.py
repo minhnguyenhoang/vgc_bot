@@ -122,30 +122,6 @@ class SHP(Player):
         return score
 
     @staticmethod
-    def _should_dynamax(battle: AbstractBattle, n_remaining_mons: int):
-        if battle.can_dynamax:
-            # Last full HP mon
-            if (
-                len([m for m in battle.team.values() if m.current_hp_fraction == 1])
-                == 1
-                and battle.active_pokemon.current_hp_fraction == 1
-            ):
-                return True
-            # Matchup advantage and full hp on full hp
-            if (
-                SimpleHeuristicsPlayer._estimate_matchup(
-                    battle.active_pokemon, battle.opponent_active_pokemon
-                )
-                > 0
-                and battle.active_pokemon.current_hp_fraction == 1
-                and battle.opponent_active_pokemon.current_hp_fraction == 1
-            ):
-                return True
-            if n_remaining_mons == 1:
-                return True
-        return False
-
-    @staticmethod
     def _should_mega_evolve(battle: AbstractBattle, n_remaining_mons: int):
         if battle.can_mega_evolve:
             if (
@@ -166,36 +142,6 @@ class SHP(Player):
             if n_remaining_mons == 1:
                 return True
         return False
-
-    @staticmethod
-    def _should_terastallize(battle: Battle, move: Move) -> bool:
-        active = battle.active_pokemon
-        opp_active = battle.opponent_active_pokemon
-        if (
-            not battle.can_tera
-            or not active
-            or not opp_active
-            or active.tera_type is None
-        ):
-            return False
-        offensive_tera_score = opp_active.damage_multiplier(move.type)
-        defensive_score = min(
-            [1 / (active.damage_multiplier(t) or 1 / 8) for t in opp_active.types]
-        )
-        defensive_tera_score = min(
-            [
-                1
-                / (
-                    t.damage_multiplier(
-                        active.tera_type,
-                        type_chart=GenData.from_gen(battle.gen).type_chart,
-                    )
-                    or 1 / 8
-                )
-                for t in opp_active.types
-            ]
-        )
-        return offensive_tera_score * (defensive_tera_score / defensive_score) > 1
 
     @staticmethod
     def _should_switch_out(battle: AbstractBattle):
