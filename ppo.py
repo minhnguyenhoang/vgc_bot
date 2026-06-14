@@ -5,7 +5,7 @@ from typing import Any, Awaitable, Optional, Tuple
 
 import numpy as np
 import torch
-from gymnasium.spaces import Box
+from gymnasium.spaces import Box, Discrete
 from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.data import GenData
 from poke_env.environment import DoublesEnv, SingleAgentWrapper
@@ -17,9 +17,12 @@ from poke_env.player import (
     RandomPlayer,
     SimpleHeuristicsPlayer,
 )
-from poke_env.player.battle_order import DefaultBattleOrder
-from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
-from sb3_contrib.common.wrappers import ActionMasker
+from poke_env.player.battle_order import (
+    DoubleBattleOrder,
+    ForfeitBattleOrder,
+    PassBattleOrder,
+    SingleBattleOrder,
+)
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.policies import ActorCriticPolicy
@@ -98,28 +101,68 @@ class MaskedActorCriticPolicy(ActorCriticPolicy):
             features_extractor_class=FeaturesExtractor,
         )
 
+    # -------------------------
+    # MAIN FIX
+    # -------------------------
+    def _get_action_dist_from_latent(self, latent_pi):
+        action_logits = self.action_net(latent_pi)
+
+        B = action_logits.shape[0]
+        N = DoublesEnv.get_action_space_size(
+            GenData.from_format(BATTLE_FORMAT).gen
+        )  # fixed from environment
+
+        # reshape logits into joint grid
+        logits = action_logits.view(B, N, N)
+
+        # original mask is still [B, 214]
+        mask = self._mask
+
+        mask_p1 = mask[:, :N]
+        mask_p2 = mask[:, N:]
+
+        # build joint mask via AND (your rule)
+        joint_mask = mask_p1[:, :, None] & mask_p2[:, None, :]
+
+        invalid = torch.ones((N, N), device=logits.device, dtype=torch.int)
+
+        invalid_ranges = [
+            (27, 46),
+            (47, 66),
+            (67, 86),
+            (87, 106),
+        ]
+
+        # Once-per-battle mechanics
+        for l, r in invalid_ranges:
+            invalid[l : r + 1, l : r + 1] = 0
+
+        # Invalid switching
+        idx = torch.arange(1, 7, device=invalid.device)
+        invalid[idx, idx] = 0
+
+        final_mask = joint_mask & invalid
+
+        # apply mask
+        logits = logits.masked_fill(final_mask == 0, -1e9)
+
+        # flatten back
+        logits = logits.view(B, N * N)
+
+        return self.action_dist.proba_distribution(logits)
+
+    # -------------------------
+    # ENSURE MASK IS AVAILABLE
+    # -------------------------
     def forward(self, obs, deterministic=False):
         self._mask = obs["action_mask"]
         actions, values, log_prob = super().forward(obs, deterministic)
-
-        print("sampled actions:", actions)
         return actions, values, log_prob
 
     def evaluate_actions(self, obs, actions):
+        # must match forward masking
         self._mask = obs["action_mask"]
         return super().evaluate_actions(obs, actions)
-
-    def _get_action_dist_from_latent(self, latent_pi):
-        action_logits = self.action_net(latent_pi)
-        mask = torch.where(self._mask == 1, 0, float("-inf"))
-        mask[0][0] = float("-inf")
-        mask[0][107] = float("-inf")
-        a = self.action_dist.proba_distribution(action_logits + mask)
-        print(a, mask)
-        for idx, value in enumerate(mask[0]):
-            if value != float("-inf"):
-                print(idx)
-        return a
 
 
 class FeaturesExtractor(BaseFeaturesExtractor):
@@ -249,7 +292,14 @@ class RLEnv(DoublesEnv):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.observation_spaces = {
-            agent: Box(-1, 4, shape=(N_FEATURES,), dtype=np.float32)
+            agent: Box(-5, 5, shape=(N_FEATURES,), dtype=np.float32)
+            for agent in self.possible_agents
+        }
+        self.action_spaces = {
+            agent: Discrete(
+                DoublesEnv.get_action_space_size(GenData.from_format(BATTLE_FORMAT).gen)
+                ** 2
+            )
             for agent in self.possible_agents
         }
 
@@ -276,6 +326,188 @@ class RLEnv(DoublesEnv):
 
     def embed_battle(self, battle: AbstractBattle):
         return RLPlayer.embed_battle(battle)
+
+    @staticmethod
+    def action_to_order(
+        action: int,
+        battle: DoubleBattle,
+        fake: bool = False,
+        strict: bool = False,
+    ) -> BattleOrder:
+        strict = False
+        s = DoublesEnv.get_action_space_size(GenData.from_format(BATTLE_FORMAT).gen)
+        npaction = np.int64(action)
+        a1, a2 = npaction // s, npaction % s
+        if a1 == -2 and a2 == -2:
+            return DefaultBattleOrder()
+        elif a1 == -1 or a2 == -1:
+            return ForfeitBattleOrder()
+        try:
+            order1 = DoublesEnv._action_to_order_individual(a1, battle, fake, 0)
+        except ValueError as e:
+            if strict:
+                raise e
+            else:
+                if battle.logger is not None:
+                    battle.logger.warning(str(e) + " Defaulting to random move.")
+                order = Player.choose_random_doubles_move(battle)
+                order1 = (
+                    order.first_order
+                    if not isinstance(order, DefaultBattleOrder)
+                    else order
+                )
+        try:
+            order2 = DoublesEnv._action_to_order_individual(a2, battle, fake, 1)
+        except ValueError as e:
+            if strict:
+                raise e
+            else:
+                if battle.logger is not None:
+                    battle.logger.warning(str(e) + " Defaulting to random move.")
+                order = Player.choose_random_doubles_move(battle)
+                order2 = (
+                    order.second_order
+                    if not isinstance(order, DefaultBattleOrder)
+                    else order
+                )
+        joined_orders = DoubleBattleOrder.join_orders([order1], [order2])
+        if not joined_orders:
+            error_msg = (
+                f"Invalid action {action} from player {battle.player_username} "
+                f"in battle {battle.battle_tag} - converted orders {order1} "
+                f"and {order2} are incompatible!"
+            )
+            if strict:
+                raise ValueError(error_msg)
+            else:
+                if battle.logger is not None:
+                    battle.logger.warning(error_msg + " Defaulting to random move.")
+                return Player.choose_random_doubles_move(battle)
+        else:
+            return joined_orders[0]
+
+    @staticmethod
+    def _action_to_order_individual(
+        action: np.int64, battle: DoubleBattle, fake: bool, pos: int
+    ) -> SingleBattleOrder:
+        if action == -2:
+            return DefaultBattleOrder()
+        elif action == 0:
+            order: SingleBattleOrder = PassBattleOrder()
+        elif action < 7:
+            order = Player.create_order(list(battle.team.values())[action - 1])
+        else:
+            active_mon = battle.active_pokemon[pos]
+            if active_mon is None:
+                raise ValueError(
+                    f"Invalid order from player {battle.player_username} "
+                    f"in battle {battle.battle_tag} at position {pos} - action "
+                    f"specifies a move, but battle.active_pokemon is None!"
+                )
+            avail_ids = [m.id for m in battle.available_moves[pos]]
+            known_moves = list(active_mon.moves.values())[:4]
+            known_ids = [m.id for m in known_moves]
+            mvs = (
+                battle.available_moves[pos]
+                if len(avail_ids) == 1 and avail_ids[0] not in known_ids
+                else known_moves
+            )
+            if (action - 7) % 20 // 5 not in range(len(mvs)):
+                raise ValueError(
+                    f"Invalid action {action} from player {battle.player_username} "
+                    f"in battle {battle.battle_tag} at position {pos} - action "
+                    f"specifies a move but the move index {(action - 7) % 20 // 5} "
+                    f"is out of bounds for available moves {mvs}!"
+                )
+            order = Player.create_order(
+                mvs[(action - 7) % 20 // 5],
+                move_target=(action.item() - 7) % 5 - 2,
+                mega=(action - 7) // 20 == 1,
+                z_move=(action - 7) // 20 == 2,
+                dynamax=(action - 7) // 20 == 3,
+                terastallize=(action - 7) // 20 == 4,
+            )
+        if not fake and str(order) not in [str(o) for o in battle.valid_orders[pos]]:
+            raise ValueError(
+                f"Invalid action {action} from player {battle.player_username} "
+                f"in battle {battle.battle_tag} at position {pos} - order {order} "
+                f"not in action space {[str(o) for o in battle.valid_orders[pos]]}!"
+            )
+        return order
+
+    @staticmethod
+    def order_to_action(
+        order: BattleOrder,
+        battle: DoubleBattle,
+        fake: bool = False,
+        strict: bool = False,
+    ) -> int:
+        if isinstance(order, DefaultBattleOrder):
+            return np.array([-2, -2])
+        elif isinstance(order, ForfeitBattleOrder):
+            return np.array([-1, -1])
+        assert isinstance(order, DoubleBattleOrder)
+        joined_orders = DoubleBattleOrder.join_orders(
+            [order.first_order], [order.second_order]
+        )
+        if not fake and not joined_orders:
+            error_msg = (
+                f"Invalid order {order} from player {battle.player_username} "
+                f"in battle {battle.battle_tag} - orders are incompatible!"
+            )
+            if strict:
+                raise ValueError(error_msg)
+            else:
+                if battle.logger is not None:
+                    battle.logger.warning(error_msg + " Defaulting to random move.")
+                return DoublesEnv.order_to_action(
+                    Player.choose_random_doubles_move(battle), battle, fake, strict
+                )
+        try:
+            action1 = DoublesEnv._order_to_action_individual(
+                order.first_order, battle, fake, 0
+            )
+        except ValueError as e:
+            if strict:
+                raise e
+            else:
+                if battle.logger is not None:
+                    battle.logger.warning(str(e) + " Defaulting to random move.")
+                order = Player.choose_random_doubles_move(battle)
+                action1 = DoublesEnv._order_to_action_individual(
+                    (
+                        order.first_order
+                        if not isinstance(order, DefaultBattleOrder)
+                        else order
+                    ),
+                    battle,
+                    fake,
+                    0,
+                )
+        try:
+            action2 = DoublesEnv._order_to_action_individual(
+                order.second_order, battle, fake, 1
+            )
+        except ValueError as e:
+            if strict:
+                raise e
+            else:
+                if battle.logger is not None:
+                    battle.logger.warning(str(e) + " Defaulting to random move.")
+                order = Player.choose_random_doubles_move(battle)
+                action2 = DoublesEnv._order_to_action_individual(
+                    (
+                        order.second_order
+                        if not isinstance(order, DefaultBattleOrder)
+                        else order
+                    ),
+                    battle,
+                    fake,
+                    1,
+                )
+        return int(action1) * DoublesEnv.get_action_space_size(
+            GenData.from_format(BATTLE_FORMAT).gen
+        ) + int(action2)
 
 
 def train():

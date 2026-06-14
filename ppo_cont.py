@@ -5,9 +5,14 @@ import numpy as np
 from poke_env.battle import DoubleBattle
 from poke_env.data import GenData
 from poke_env.player import Player, RandomPlayer
-from poke_env.player.battle_order import DoubleBattleOrder
+from poke_env.player.battle_order import (
+    DefaultBattleOrder,
+    DoubleBattleOrder,
+    ForfeitBattleOrder,
+    PassBattleOrder,
+    SingleBattleOrder,
+)
 
-FEATURE_DIM = 32
 BATTLE_FORMAT = "gen9championsvgc2026regma"
 TEAM = """Incineroar @ Sitrus Berry
 Ability: Intimidate
@@ -71,12 +76,21 @@ Timid Nature
 """
 
 
-class HeuristicRLPlayer(Player):
-    def __init__(self, *args, **kwargs):
+# -----------------------------
+# Heuristic RL Player
+# -----------------------------
+class HeuristicDoublesPlayer(Player):
+    def __init__(self, *args, lr=0.01, **kwargs):
         super().__init__(*args, **kwargs)
 
+        self.lr = lr
         self.w = None
+        self.memory = []
 
+    # -----------------------------
+    # STATE
+    # -----------------------------
+    #
     def teampreview(self, battle):
         # 1 = Incineroar, 2 = Sinistcha, 3 = Mega Floette, 4 = Garchomp, 5 = Mega Charizard Y, 6 = Venusaur
         teams = ["5614", "5624", "5612", "1324", "1326"]
@@ -120,57 +134,41 @@ class HeuristicRLPlayer(Player):
 
         return "/team " + teams[team_perms.index(avg_score[-1][1])]
 
-    def choose_move(self, battle: DoubleBattle):
-        # Chooses a move with the highest base power when possible
-        if battle.available_moves:
-            # Iterating over available moves to find the one with the highest base power
-            joint_actions = [
-                (o1, o2)
-                for o1 in battle.valid_orders[0]
-                for o2 in battle.valid_orders[1]
-                if DoubleBattleOrder.join_orders([o1], [o2])
-            ]
-
-            return DoubleBattleOrder(joint_actions[0][0], joint_actions[0][1])
-        else:
-            # If no attacking move is available, perform a random switch
-            # This involves choosing a random move, which could be a switch or another available action
-            return self.choose_random_move(battle)
-
-    @staticmethod
-    def embed_battle(battle: DoubleBattle):
+    def embed_battle(self, battle: DoubleBattle):
         moves_base_power = -np.ones(8)
         moves_dmg_multiplier = np.ones(16)
-        for i, move in enumerate(battle.available_moves[0] + battle.available_moves[1]):
+
+        flat_moves = battle.available_moves[0] + battle.available_moves[1]
+
+        for i, move in enumerate(flat_moves[:8]):
             moves_base_power[i] = move.base_power / 100
-            if battle.opponent_active_pokemon[0] is not None:
-                moves_dmg_multiplier[i * 2] = move.type.damage_multiplier(
-                    battle.opponent_active_pokemon[0].type_1,
-                    battle.opponent_active_pokemon[0].type_2,
-                    type_chart=GenData.from_gen(battle.gen).type_chart,
-                )
-            if battle.opponent_active_pokemon[1] is not None:
-                moves_dmg_multiplier[i * 2 + 1] = move.type.damage_multiplier(
-                    battle.opponent_active_pokemon[1].type_1,
-                    battle.opponent_active_pokemon[1].type_2,
-                    type_chart=GenData.from_gen(battle.gen).type_chart,
-                )
-        fainted_mon_team = len([mon for mon in battle.team.values() if mon.fainted]) / 4
-        fainted_mon_opponent = (
-            len([mon for mon in battle.opponent_team.values() if mon.fainted]) / 4
+
+            for j in range(2):
+                opp = battle.opponent_active_pokemon[j]
+                if opp is not None:
+                    moves_dmg_multiplier[i * 2 + j] = move.type.damage_multiplier(
+                        opp.type_1,
+                        opp.type_2,
+                        type_chart=GenData.from_gen(battle.gen).type_chart,
+                    )
+
+        fainted_team = len([p for p in battle.team.values() if p.fainted]) / 4
+        fainted_opp = len([p for p in battle.opponent_team.values() if p.fainted]) / 4
+
+        our_hp = np.array(
+            [p.current_hp_fraction if p else 0 for p in battle.active_pokemon]
         )
-        our_hp = tuple(
-            x.current_hp_fraction if x else 0.0 for x in battle.active_pokemon
+        opp_hp = np.array(
+            [p.current_hp_fraction if p else 0 for p in battle.opponent_active_pokemon]
         )
-        opp_hp = tuple(
-            x.current_hp_fraction if x else 0.0 for x in battle.opponent_active_pokemon
-        )
-        can_mega = tuple(1 if x else 0 for x in battle.can_mega_evolve)
+
+        can_mega = np.array(battle.can_mega_evolve, dtype=np.float32)
+
         return np.concatenate(
             [
                 moves_base_power,
                 moves_dmg_multiplier,
-                [fainted_mon_team, fainted_mon_opponent],
+                [fainted_team, fainted_opp],
                 our_hp,
                 opp_hp,
                 can_mega,
@@ -178,22 +176,119 @@ class HeuristicRLPlayer(Player):
             dtype=np.float32,
         )
 
+    # -----------------------------
+    # FIXED ACTION ENCODING (IMPORTANT)
+    # -----------------------------
+    def encode_action(self, a):
+        # PASS / DEFAULT / FORFEIT
+        if isinstance(a, PassBattleOrder):
+            return np.array([0.0, 1.0, 0.0])
+
+        if isinstance(a, DefaultBattleOrder):
+            return np.array([0.0, 1.0, 0.0])
+
+        if isinstance(a, ForfeitBattleOrder):
+            return np.array([-1.0, 0.0, 0.0])
+
+        # SWITCH (poke-env uses pokemon attribute)
+        if hasattr(a, "pokemon") and a.pokemon is not None:
+            return np.array([1.0, 0.0, 0.0])
+
+        # MOVE
+        if hasattr(a, "move") and a.move is not None:
+            bp = getattr(a.move, "base_power", 0) or 0
+            return np.array([0.0, 0.0, bp / 100.0])
+
+        return np.array([0.0, 0.0, 0.0])
+
+    def action_features(self, a1, a2):
+        return np.concatenate([self.encode_action(a1), self.encode_action(a2)])
+
+    # -----------------------------
+    # FEATURES
+    # -----------------------------
+    def features(self, battle, action):
+        a1, a2 = action
+        return np.concatenate([self.embed_battle(battle), self.action_features(a1, a2)])
+
+    # -----------------------------
+    # SCORE
+    # -----------------------------
+    def score(self, battle, action):
+        f = self.features(battle, action)
+
+        if self.w is None:
+            self.w = np.zeros_like(f)
+
+        return float(np.dot(self.w, f))
+
+    # -----------------------------
+    # POLICY
+    # -----------------------------
+    def choose_move(self, battle: DoubleBattle):
+        if battle.wait:
+            return self.choose_default_move(battle)
+
+        joint_actions = [
+            (o1, o2)
+            for o1 in battle.valid_orders[0]
+            for o2 in battle.valid_orders[1]
+            if DoubleBattleOrder.join_orders([o1], [o2])
+        ]
+
+        if not joint_actions:
+            return self.choose_random_move(battle)
+
+        best_action = None
+        best_score = -1e9
+
+        for a1, a2 in joint_actions:
+            s = self.score(battle, (a1, a2))
+            if s > best_score:
+                best_score = s
+                best_action = (a1, a2)
+
+        # store FEATURES (NOT battle object)
+        self.memory.append(self.features(battle, best_action))
+
+        return DoubleBattleOrder(best_action[0], best_action[1])
+
+    # -----------------------------
+    # LEARNING
+    # -----------------------------
+    def update_after_battle(self, won: bool):
+        if self.w is None or not self.memory:
+            self.memory = []
+            return
+
+        reward = 1.0 if won else -1.0
+
+        for f in self.memory:
+            self.w += self.lr * reward * f / len(self.memory)
+
+        self.memory = []
+
+    def _battle_finished_callback(self, battle):
+        super()._battle_finished_callback(battle)
+        self.update_after_battle(battle.won)
+
 
 async def main():
-    player_1 = HeuristicRLPlayer(
-        max_concurrent_battles=1,
+    agent = HeuristicDoublesPlayer(
         battle_format=BATTLE_FORMAT,
+        max_concurrent_battles=1,
         team=TEAM,
-        save_replays="replays",
-    )
-    player_2 = RandomPlayer(
-        max_concurrent_battles=1, battle_format=BATTLE_FORMAT, team=TEAM
+        save_replays=True,
     )
 
-    await player_1.battle_against(player_2, n_battles=1)
+    opponent = RandomPlayer(
+        battle_format=BATTLE_FORMAT, max_concurrent_battles=1, team=TEAM
+    )
 
-    print(f"Finished battles: {player_1.n_finished_battles}")
-    print(f"Player 1 wins: {player_1.n_won_battles}")
+    await agent.battle_against(opponent, n_battles=1)
+
+    print("Finished battles:", agent.n_finished_battles)
+    print("Wins:", agent.n_won_battles)
 
 
 if __name__ == "__main__":
