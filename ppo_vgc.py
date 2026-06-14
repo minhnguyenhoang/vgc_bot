@@ -1,14 +1,18 @@
 import asyncio
 import os
+import random
 import shutil
+import traceback
 from itertools import combinations
-from pprint import pprint
 from typing import Any, Awaitable, Optional, Tuple
+from unittest.mock import Mock
 
 import numpy as np
 import torch
 from gymnasium.spaces import Box, Discrete
+from poke_env import cross_evaluate
 from poke_env.battle import AbstractBattle, DoubleBattle
+from poke_env.battle.pokemon import Pokemon
 from poke_env.data import GenData
 from poke_env.environment import DoublesEnv, SingleAgentWrapper
 from poke_env.player import (
@@ -24,14 +28,18 @@ from poke_env.player.battle_order import (
     ForfeitBattleOrder,
     PassBattleOrder,
     SingleBattleOrder,
+    _EmptyBattleOrder,
 )
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from tabulate import tabulate
+
+from simple_heuristic_w_mega import SHP
 
 N_FEATURES = 32
-BATTLE_FORMAT = "gen9randomdoublesbattle"
+BATTLE_FORMAT = "gen9championsvgc2026regma"
 TEAM = """Incineroar @ Sitrus Berry
 Ability: Intimidate
 Level: 50
@@ -92,6 +100,8 @@ Timid Nature
 - Sleep Powder
 - Protect
 """
+
+random.seed(42)
 
 
 class MaskedActorCriticPolicy(ActorCriticPolicy):
@@ -159,6 +169,7 @@ class MaskedActorCriticPolicy(ActorCriticPolicy):
     def forward(self, obs, deterministic=False):
         self._mask = obs["action_mask"]
         actions, values, log_prob = super().forward(obs, deterministic)
+        print("POLICY ACTION:", actions)
         return actions, values, log_prob
 
     def evaluate_actions(self, obs, actions):
@@ -245,8 +256,8 @@ class RLPlayer(Player):
                 ).unsqueeze(0),
             }
             action, _, _ = self.policy.forward(obs_dict)
-        action = action.cuda().numpy()[0]
-        return DoublesEnv.action_to_order(action, battle, strict=False)
+        action = action.cpu().numpy()[0]
+        return RLEnv.action_to_order(action, battle, strict=False)
 
     @staticmethod
     def embed_battle(battle: DoubleBattle):
@@ -290,6 +301,11 @@ class RLPlayer(Player):
         )
 
 
+class TeamPrevOrder(SingleBattleOrder):
+    def __init__(self, p: Pokemon):
+        self.order = p
+
+
 class RLEnv(DoublesEnv):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -309,10 +325,10 @@ class RLEnv(DoublesEnv):
     def create_env(cls) -> Monitor:
         env = cls(
             battle_format=BATTLE_FORMAT,
-            log_level=20,
+            log_level=25,
             open_timeout=None,
-            # team=TEAM,
-            save_replays="replays/RL_Training",
+            team=TEAM,
+            save_replays="replays/RL_Training_VGC",
         )
         opponent = SimpleHeuristicsPlayer(start_listening=False)
         return Monitor(SingleAgentWrapper(env, opponent))
@@ -320,8 +336,8 @@ class RLEnv(DoublesEnv):
     def calc_reward(self, battle) -> float:
         return self.reward_computing_helper(
             battle,
-            fainted_value=2.0,
-            hp_value=1.0,
+            fainted_value=5.0,
+            hp_value=2.5,
             status_value=0.5,
             victory_value=30.0,
         )
@@ -329,18 +345,114 @@ class RLEnv(DoublesEnv):
     def embed_battle(self, battle: AbstractBattle):
         return RLPlayer.embed_battle(battle)
 
+    def teampreview(self, battle):
+        # 1 = Incineroar, 2 = Sinistcha, 3 = Mega Floette, 4 = Garchomp, 5 = Mega Charizard Y, 6 = Venusaur
+        teams = ["5614", "5624", "5612", "1324", "1326"]
+
+        def teampreview_performance(mon_a, mon_b):
+            a_on_b = b_on_a = -np.inf
+            for type_ in mon_a.types:
+                if type_:
+                    a_on_b = max(
+                        a_on_b,
+                        type_.damage_multiplier(
+                            *mon_b.types, type_chart=GenData.from_gen(9).type_chart
+                        ),
+                    )
+            for type_ in mon_b.types:
+                if type_:
+                    b_on_a = max(
+                        b_on_a,
+                        type_.damage_multiplier(
+                            *mon_a.types, type_chart=GenData.from_gen(9).type_chart
+                        ),
+                    )
+            return a_on_b - b_on_a
+
+        team_perms = [
+            [list(battle.team.values())[int(x) - 1] for x in y] for y in teams
+        ]
+        opponent_team_perms = list(combinations(battle.opponent_team.values(), 4))
+
+        score = {x: 0 for x in battle.team.values()}
+        for mon in battle.team.values():
+            perf = []
+            for opp_team in opponent_team_perms:
+                a = [teampreview_performance(mon, opp) for opp in opp_team]
+                perf.append(np.mean(a))
+            score[mon] = np.median(perf) * 0.65 + np.mean(perf) * 0.35 + 1
+
+        avg_score = sorted(
+            [(sum([score[x] for x in team]), team) for team in team_perms]
+        )
+
+        return "/team " + teams[team_perms.index(avg_score[-1][1])]
+
     @staticmethod
     def action_to_order(
-        action: int,
+        action,
         battle: DoubleBattle,
         fake: bool = False,
         strict: bool = False,
     ) -> BattleOrder:
+        print("==== action_to_order called ====")
+        traceback.print_stack()
+        print("action:", action)
+
         strict = False
         s = DoublesEnv.get_action_space_size(GenData.from_format(BATTLE_FORMAT).gen)
-        npaction = np.int64(action)
-        a1, a2 = npaction // s, npaction % s
-        print(npaction, a1, a2)
+
+        print(f"In team preview: {battle.teampreview}")
+
+        if battle.teampreview:
+            # 1 = Incineroar, 2 = Sinistcha, 3 = Mega Floette, 4 = Garchomp, 5 = Mega Charizard Y, 6 = Venusaur
+            turn1 = ["56", "13"]
+            turn2_56 = ["14", "24", "12"]
+            turn2_13 = ["24", "26"]
+
+            l1 = [x for x in list(battle.team.values()) if x.selected_in_teampreview]
+            l2 = [
+                x for x in list(battle.team.values()) if not x.selected_in_teampreview
+            ]
+            print("Picked in teampreview: ", len(l1))
+            print("Picked: ", l1)
+            print("Unpicked: ", l2)
+            print("Available switches: ", battle.available_switches[0])
+            print([p.base_species for p in battle.team.values()])
+
+            if len(l2) == 6:
+                # leads = random.choice(turn1)
+                leads = turn1[0]
+                a1 = np.int64(leads[0])
+                a2 = np.int64(leads[1])
+                order1 = TeamPrevOrder(l2[a1 - 1])
+                order2 = TeamPrevOrder(l2[a2 - 1])
+                print(a1, a2, leads, "teamprev1")
+                a = DoubleBattleOrder.join_orders([order1], [order2])[0]
+                print(a)
+                return a
+            elif len(l2) == 4:
+                l = list(battle.team.values())
+                if l[-1] in l1:
+                    backs = random.choice(turn2_13)
+                    a1 = np.int64(l2.index(l[int(backs[0]) - 1]))
+                    a2 = np.int64(l2.index(l[int(backs[1]) - 1]))
+                else:
+                    backs = random.choice(turn2_56)
+                    a1 = np.int64(l2.index(l[int(backs[0]) - 1]))
+                    a2 = np.int64(l2.index(l[int(backs[1]) - 1]))
+                print(a1, a2, "teamprev2")
+            else:
+                return Player.choose_random_doubles_move(battle)
+        else:
+            if isinstance(action, (list, np.ndarray)) or hasattr(action, "__len__"):
+                a1, a2 = np.int64(action[0]), np.int64(action[1])
+                print(a1, a2)
+            else:
+                # Normal calculation pathway for your standard integer scalars
+                npaction = np.int64(action)
+                a1, a2 = int(npaction // s), int(npaction % s)
+                print(npaction, a1, a2)
         if a1 == -2 and a2 == -2:
             return DefaultBattleOrder()
         elif a1 == -1 or a2 == -1:
@@ -393,6 +505,7 @@ class RLEnv(DoublesEnv):
     def _action_to_order_individual(
         action: np.int64, battle: DoubleBattle, fake: bool, pos: int
     ) -> SingleBattleOrder:
+        action = np.int64(action)
         if action == -2:
             return DefaultBattleOrder()
         elif action == 0:
@@ -447,9 +560,9 @@ class RLEnv(DoublesEnv):
     ) -> np.int64:
         strict = False
         if isinstance(order, DefaultBattleOrder):
-            return np.array([-2, -2])
+            return -212
         elif isinstance(order, ForfeitBattleOrder):
-            return np.array([-1, -1])
+            return -106
         assert isinstance(order, DoubleBattleOrder)
         joined_orders = DoubleBattleOrder.join_orders(
             [order.first_order], [order.second_order]
@@ -516,8 +629,8 @@ class RLEnv(DoublesEnv):
         )
 
 
-def train():
-    folder = "replays/RL_Training"
+async def train():
+    folder = "replays/RL_Training_VGC"
     if os.path.exists(folder):
         shutil.rmtree(folder)
     os.makedirs(folder)
@@ -532,7 +645,7 @@ def train():
         batch_size=128,
         gamma=0.99,
         ent_coef=0.01,
-        device="cuda",
+        device="cpu",
     )
 
     # Training
@@ -544,20 +657,25 @@ def train():
     agent = RLPlayer(
         policy=ppo.policy,
         battle_format=BATTLE_FORMAT,
-        max_concurrent_battles=10,
+        max_concurrent_battles=75,
         team=TEAM,
-        save_replays="replays",
+        save_replays="replays/PPO_VGC",
     )
-    opponents: list[Player] = [
-        c(battle_format=BATTLE_FORMAT, max_concurrent_battles=10, team=TEAM)
-        for c in [RandomPlayer, MaxBasePowerPlayer, SimpleHeuristicsPlayer]
+
+    players = [agent] + [
+        c(battle_format=BATTLE_FORMAT, max_concurrent_battles=25, team=TEAM)
+        for c in [SHP, RandomPlayer, MaxBasePowerPlayer, SimpleHeuristicsPlayer]
     ]
-    asyncio.run(agent.battle_against(*opponents, n_battles=100))
-    print("--- Win rates vs bots ---")
-    for opp in opponents:
-        win_rate = round(100 * opp.n_lost_battles / opp.n_finished_battles)
-        print(f"{opp.username}: {win_rate}%")
+
+    cross_evaluation = await cross_evaluate(players, n_challenges=2500)
+
+    table = [["-"] + [p.username for p in players]]
+    for p_1, results in cross_evaluation.items():
+        table.append([p_1] + [cross_evaluation[p_1][p_2] for p_2 in results])
+
+    with open("results/ppo.txt", "w", encoding="utf-8") as f:
+        f.write(tabulate(table))
 
 
 if __name__ == "__main__":
-    train()
+    asyncio.run(train())

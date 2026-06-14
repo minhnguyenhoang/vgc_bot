@@ -249,8 +249,8 @@ class RLPlayer(Player):
                 ).unsqueeze(0),
             }
             action, _, _ = self.policy.forward(obs_dict)
-        action = action.cuda().numpy()[0]
-        return DoublesEnv.action_to_order(action, battle, strict=False)
+        action = action.cpu().numpy()[0]
+        return RLEnv.action_to_order(action, battle, strict=False)
 
     @staticmethod
     def embed_battle(battle: DoubleBattle):
@@ -536,7 +536,7 @@ async def train():
         batch_size=128,
         gamma=0.99,
         ent_coef=0.01,
-        device="cuda",
+        device="cpu",
     )
 
     # Training
@@ -548,13 +548,13 @@ async def train():
     agent = RLPlayer(
         policy=ppo.policy,
         battle_format=BATTLE_FORMAT,
-        max_concurrent_battles=10,
-        team=TEAM,
+        max_concurrent_battles=75,
+        # team=TEAM,
         save_replays="replays",
     )
 
     players = [agent] + [
-        c(battle_format=BATTLE_FORMAT, max_concurrent_battles=25, team=TEAM)
+        c(battle_format=BATTLE_FORMAT, max_concurrent_battles=25)
         for c in [SHP, RandomPlayer, MaxBasePowerPlayer, SimpleHeuristicsPlayer]
     ]
 
