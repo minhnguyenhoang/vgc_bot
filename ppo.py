@@ -1,4 +1,6 @@
 import asyncio
+import os
+import shutil
 from itertools import combinations
 from pprint import pprint
 from typing import Any, Awaitable, Optional, Tuple
@@ -6,6 +8,7 @@ from typing import Any, Awaitable, Optional, Tuple
 import numpy as np
 import torch
 from gymnasium.spaces import Box, Discrete
+from poke_env import cross_evaluate
 from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.data import GenData
 from poke_env.environment import DoublesEnv, SingleAgentWrapper
@@ -27,6 +30,9 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from tabulate import tabulate
+
+from simple_heuristic_w_mega import SHP
 
 N_FEATURES = 32
 BATTLE_FORMAT = "gen9randomdoublesbattle"
@@ -307,10 +313,10 @@ class RLEnv(DoublesEnv):
     def create_env(cls) -> Monitor:
         env = cls(
             battle_format=BATTLE_FORMAT,
-            log_level=40,
+            log_level=25,
             open_timeout=None,
             # team=TEAM,
-            save_replays="replays",
+            save_replays="replays/RL_Training",
         )
         opponent = SimpleHeuristicsPlayer(start_listening=False)
         return Monitor(SingleAgentWrapper(env, opponent))
@@ -338,12 +344,13 @@ class RLEnv(DoublesEnv):
         s = DoublesEnv.get_action_space_size(GenData.from_format(BATTLE_FORMAT).gen)
         npaction = np.int64(action)
         a1, a2 = npaction // s, npaction % s
+        print(npaction, a1, a2)
         if a1 == -2 and a2 == -2:
             return DefaultBattleOrder()
         elif a1 == -1 or a2 == -1:
             return ForfeitBattleOrder()
         try:
-            order1 = DoublesEnv._action_to_order_individual(a1, battle, fake, 0)
+            order1 = RLEnv._action_to_order_individual(a1, battle, fake, 0)
         except ValueError as e:
             if strict:
                 raise e
@@ -357,7 +364,7 @@ class RLEnv(DoublesEnv):
                     else order
                 )
         try:
-            order2 = DoublesEnv._action_to_order_individual(a2, battle, fake, 1)
+            order2 = RLEnv._action_to_order_individual(a2, battle, fake, 1)
         except ValueError as e:
             if strict:
                 raise e
@@ -441,7 +448,8 @@ class RLEnv(DoublesEnv):
         battle: DoubleBattle,
         fake: bool = False,
         strict: bool = False,
-    ) -> int:
+    ) -> np.int64:
+        strict = False
         if isinstance(order, DefaultBattleOrder):
             return np.array([-2, -2])
         elif isinstance(order, ForfeitBattleOrder):
@@ -460,7 +468,7 @@ class RLEnv(DoublesEnv):
             else:
                 if battle.logger is not None:
                     battle.logger.warning(error_msg + " Defaulting to random move.")
-                return DoublesEnv.order_to_action(
+                return order_to_action(
                     Player.choose_random_doubles_move(battle), battle, fake, strict
                 )
         try:
@@ -505,13 +513,19 @@ class RLEnv(DoublesEnv):
                     fake,
                     1,
                 )
-        return int(action1) * DoublesEnv.get_action_space_size(
-            GenData.from_format(BATTLE_FORMAT).gen
-        ) + int(action2)
+        return np.int64(
+            int(action1)
+            * DoublesEnv.get_action_space_size(GenData.from_format(BATTLE_FORMAT).gen)
+            + int(action2)
+        )
 
 
-def train():
-    # setup
+async def train():
+    folder = "replays/RL_Training"
+    if os.path.exists(folder):
+        shutil.rmtree(folder)
+    os.makedirs(folder)
+
     num_envs = 2
     env = RLEnv.create_env()
     ppo = PPO(
@@ -525,11 +539,12 @@ def train():
         device="cuda",
     )
 
-    # train
+    # Training
+    print("Training...")
     ppo.learn(98_304, progress_bar=True)
     env.close()
 
-    # evaluate
+    # Testing/Evaluation
     agent = RLPlayer(
         policy=ppo.policy,
         battle_format=BATTLE_FORMAT,
@@ -537,16 +552,21 @@ def train():
         team=TEAM,
         save_replays="replays",
     )
-    opponents: list[Player] = [
-        c(battle_format=BATTLE_FORMAT, max_concurrent_battles=10, team=TEAM)
-        for c in [RandomPlayer, MaxBasePowerPlayer, SimpleHeuristicsPlayer]
+
+    players = [agent] + [
+        c(battle_format=BATTLE_FORMAT, max_concurrent_battles=25, team=TEAM)
+        for c in [SHP, RandomPlayer, MaxBasePowerPlayer, SimpleHeuristicsPlayer]
     ]
-    asyncio.run(agent.battle_against(*opponents, n_battles=100))
-    print("--- Win rates vs bots ---")
-    for opp in opponents:
-        win_rate = round(100 * opp.n_lost_battles / opp.n_finished_battles)
-        print(f"{opp.username}: {win_rate}%")
+
+    cross_evaluation = await cross_evaluate(players, n_challenges=2500)
+
+    table = [["-"] + [p.username for p in players]]
+    for p_1, results in cross_evaluation.items():
+        table.append([p_1] + [cross_evaluation[p_1][p_2] for p_2 in results])
+
+    with open("results/ppo.txt", "w", encoding="utf-8") as f:
+        f.write(tabulate(table))
 
 
 if __name__ == "__main__":
-    train()
+    asyncio.run(train())
