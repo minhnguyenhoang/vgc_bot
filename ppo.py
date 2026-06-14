@@ -525,6 +525,10 @@ async def train():
     if os.path.exists(folder):
         shutil.rmtree(folder)
     os.makedirs(folder)
+    folder = "replays/PPO"
+    if os.path.exists(folder):
+        shutil.rmtree(folder)
+    os.makedirs(folder)
 
     num_envs = 2
     env = RLEnv.create_env()
@@ -542,6 +546,7 @@ async def train():
     # Training
     print("Training...")
     ppo.learn(98_304, progress_bar=True)
+    ppo.save("ppo")
     env.close()
 
     # Testing/Evaluation
@@ -550,7 +555,7 @@ async def train():
         battle_format=BATTLE_FORMAT,
         max_concurrent_battles=75,
         # team=TEAM,
-        save_replays="replays",
+        save_replays="replays/PPO",
     )
 
     players = [agent] + [
@@ -569,4 +574,10 @@ async def train():
 
 
 if __name__ == "__main__":
+    try:
+        pending = asyncio.all_tasks()
+        for t in pending:
+            t.cancel()
+    except:
+        pass
     asyncio.run(train())

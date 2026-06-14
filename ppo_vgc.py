@@ -1,21 +1,18 @@
 import asyncio
+import gc
 import os
 import random
 import shutil
-import traceback
 from itertools import combinations
 from typing import Any, Awaitable, Optional, Tuple
-from unittest.mock import Mock
 
 import numpy as np
 import torch
 from gymnasium.spaces import Box, Discrete
 from poke_env import cross_evaluate
 from poke_env.battle import AbstractBattle, DoubleBattle
-from poke_env.battle.pokemon import Pokemon
 from poke_env.data import GenData
 from poke_env.environment import DoublesEnv, SingleAgentWrapper
-from poke_env.environment.env import _EnvPlayer
 from poke_env.player import (
     BattleOrder,
     DefaultBattleOrder,
@@ -29,7 +26,6 @@ from poke_env.player.battle_order import (
     ForfeitBattleOrder,
     PassBattleOrder,
     SingleBattleOrder,
-    _EmptyBattleOrder,
 )
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
@@ -37,7 +33,7 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from tabulate import tabulate
 
-from ppo import RLPlayer
+# from ppo import RLPlayer
 from simple_heuristic_w_mega import SHP
 
 """
@@ -111,7 +107,7 @@ Timid Nature
 random.seed(42)
 
 
-class MaskedActorCriticPolicy(ActorCriticPolicy):
+class MaskedActorCriticPolicy_VGC(ActorCriticPolicy):
     def __init__(self, *args, **kwargs):
         super().__init__(
             *args,
@@ -303,11 +299,6 @@ class RLPlayerVGC(Player):
         )
 
 
-class TeamPrevOrder(SingleBattleOrder):
-    def __init__(self, p: Pokemon):
-        self.order = p
-
-
 class RLEnv_VGC(DoublesEnv):
     def __init__(self, **kwargs):
         self._choose_on_teampreview = False
@@ -324,9 +315,6 @@ class RLEnv_VGC(DoublesEnv):
             )
             for agent in self.possible_agents
         }
-
-    async def teampreview(self, battle):
-        return Player.random_teampreview(battle=battle)
 
     @classmethod
     def create_env(cls) -> Monitor:
@@ -591,11 +579,18 @@ async def train():
     if os.path.exists(folder):
         shutil.rmtree(folder)
     os.makedirs(folder)
+    folder = "replays/PPO_VGC"
+    if os.path.exists(folder):
+        shutil.rmtree(folder)
+    os.makedirs(folder)
+
+    await asyncio.sleep(2)
+    gc.collect()
 
     num_envs = 2
     env = RLEnv_VGC.create_env()
     ppo = PPO(
-        MaskedActorCriticPolicy,
+        MaskedActorCriticPolicy_VGC,
         env,
         learning_rate=3e-4,
         n_steps=3072 // num_envs,
@@ -605,10 +600,17 @@ async def train():
         device="cpu",
     )
 
+    await asyncio.sleep(2)
+    gc.collect()
+
     # Training
     print("Training...")
     ppo.learn(98_304, progress_bar=True)
+    ppo.save("ppo_vgc_model")
     env.close()
+
+    await asyncio.sleep(2)
+    gc.collect()
 
     # Testing/Evaluation
     agent = RLPlayerVGC(
@@ -622,7 +624,7 @@ async def train():
     players = [agent] + [
         c(battle_format=BATTLE_FORMAT, max_concurrent_battles=25, team=TEAM)
         for c in [
-            RLPlayer,
+            # RLPlayer,
             SHP,
             RandomPlayer,
             MaxBasePowerPlayer,
@@ -636,9 +638,15 @@ async def train():
     for p_1, results in cross_evaluation.items():
         table.append([p_1] + [cross_evaluation[p_1][p_2] for p_2 in results])
 
-    with open("results/ppo.txt", "w", encoding="utf-8") as f:
+    with open("results/ppo_vgc.txt", "w", encoding="utf-8") as f:
         f.write(tabulate(table))
 
 
 if __name__ == "__main__":
+    try:
+        pending = asyncio.all_tasks()
+        for t in pending:
+            t.cancel()
+    except:
+        pass
     asyncio.run(train())
