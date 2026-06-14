@@ -344,7 +344,7 @@ class RLEnv(DoublesEnv):
         s = DoublesEnv.get_action_space_size(GenData.from_format(BATTLE_FORMAT).gen)
         npaction = np.int64(action)
         a1, a2 = npaction // s, npaction % s
-        print(npaction, a1, a2)
+        # print(npaction, a1, a2)
         if a1 == -2 and a2 == -2:
             return DefaultBattleOrder()
         elif a1 == -1 or a2 == -1:
