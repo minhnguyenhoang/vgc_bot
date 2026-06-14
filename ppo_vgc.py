@@ -15,6 +15,7 @@ from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.battle.pokemon import Pokemon
 from poke_env.data import GenData
 from poke_env.environment import DoublesEnv, SingleAgentWrapper
+from poke_env.environment.env import _EnvPlayer
 from poke_env.player import (
     BattleOrder,
     DefaultBattleOrder,
@@ -36,7 +37,13 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from tabulate import tabulate
 
+from ppo import RLPlayer
 from simple_heuristic_w_mega import SHP
+
+"""
+IMPORTANT NOTE:
+THIS CODE MANUALLY OVERRODE THE FLAG FOR DOUBLESENV SO THAT IT RUNS WIHT CHOOSE_TEAM_PREVIEW AS FALSE TO RANDOMISE TEAMS.
+"""
 
 N_FEATURES = 32
 BATTLE_FORMAT = "gen9championsvgc2026regma"
@@ -163,17 +170,12 @@ class MaskedActorCriticPolicy(ActorCriticPolicy):
 
         return self.action_dist.proba_distribution(logits)
 
-    # -------------------------
-    # ENSURE MASK IS AVAILABLE
-    # -------------------------
     def forward(self, obs, deterministic=False):
         self._mask = obs["action_mask"]
         actions, values, log_prob = super().forward(obs, deterministic)
-        print("POLICY ACTION:", actions)
         return actions, values, log_prob
 
     def evaluate_actions(self, obs, actions):
-        # must match forward masking
         self._mask = obs["action_mask"]
         return super().evaluate_actions(obs, actions)
 
@@ -189,7 +191,7 @@ class FeaturesExtractor(BaseFeaturesExtractor):
         return obs["observation"]
 
 
-class RLPlayer(Player):
+class RLPlayerVGC(Player):
     policy: ActorCriticPolicy | None
 
     def __init__(
@@ -257,7 +259,7 @@ class RLPlayer(Player):
             }
             action, _, _ = self.policy.forward(obs_dict)
         action = action.cpu().numpy()[0]
-        return RLEnv.action_to_order(action, battle, strict=False)
+        return RLEnv_VGC.action_to_order(action, battle, strict=False)
 
     @staticmethod
     def embed_battle(battle: DoubleBattle):
@@ -306,8 +308,10 @@ class TeamPrevOrder(SingleBattleOrder):
         self.order = p
 
 
-class RLEnv(DoublesEnv):
+class RLEnv_VGC(DoublesEnv):
     def __init__(self, **kwargs):
+        self._choose_on_teampreview = False
+        self.choose_on_teampreview = False
         super().__init__(**kwargs)
         self.observation_spaces = {
             agent: Box(-5, 5, shape=(N_FEATURES,), dtype=np.float32)
@@ -320,6 +324,9 @@ class RLEnv(DoublesEnv):
             )
             for agent in self.possible_agents
         }
+
+    async def teampreview(self, battle):
+        return Player.random_teampreview(battle=battle)
 
     @classmethod
     def create_env(cls) -> Monitor:
@@ -343,7 +350,7 @@ class RLEnv(DoublesEnv):
         )
 
     def embed_battle(self, battle: AbstractBattle):
-        return RLPlayer.embed_battle(battle)
+        return RLPlayerVGC.embed_battle(battle)
 
     def teampreview(self, battle):
         # 1 = Incineroar, 2 = Sinistcha, 3 = Mega Floette, 4 = Garchomp, 5 = Mega Charizard Y, 6 = Venusaur
@@ -395,70 +402,20 @@ class RLEnv(DoublesEnv):
         fake: bool = False,
         strict: bool = False,
     ) -> BattleOrder:
-        print("==== action_to_order called ====")
-        traceback.print_stack()
-        print("action:", action)
-
         strict = False
         s = DoublesEnv.get_action_space_size(GenData.from_format(BATTLE_FORMAT).gen)
 
-        print(f"In team preview: {battle.teampreview}")
-
-        if battle.teampreview:
-            # 1 = Incineroar, 2 = Sinistcha, 3 = Mega Floette, 4 = Garchomp, 5 = Mega Charizard Y, 6 = Venusaur
-            turn1 = ["56", "13"]
-            turn2_56 = ["14", "24", "12"]
-            turn2_13 = ["24", "26"]
-
-            l1 = [x for x in list(battle.team.values()) if x.selected_in_teampreview]
-            l2 = [
-                x for x in list(battle.team.values()) if not x.selected_in_teampreview
-            ]
-            print("Picked in teampreview: ", len(l1))
-            print("Picked: ", l1)
-            print("Unpicked: ", l2)
-            print("Available switches: ", battle.available_switches[0])
-            print([p.base_species for p in battle.team.values()])
-
-            if len(l2) == 6:
-                # leads = random.choice(turn1)
-                leads = turn1[0]
-                a1 = np.int64(leads[0])
-                a2 = np.int64(leads[1])
-                order1 = TeamPrevOrder(l2[a1 - 1])
-                order2 = TeamPrevOrder(l2[a2 - 1])
-                print(a1, a2, leads, "teamprev1")
-                a = DoubleBattleOrder.join_orders([order1], [order2])[0]
-                print(a)
-                return a
-            elif len(l2) == 4:
-                l = list(battle.team.values())
-                if l[-1] in l1:
-                    backs = random.choice(turn2_13)
-                    a1 = np.int64(l2.index(l[int(backs[0]) - 1]))
-                    a2 = np.int64(l2.index(l[int(backs[1]) - 1]))
-                else:
-                    backs = random.choice(turn2_56)
-                    a1 = np.int64(l2.index(l[int(backs[0]) - 1]))
-                    a2 = np.int64(l2.index(l[int(backs[1]) - 1]))
-                print(a1, a2, "teamprev2")
-            else:
-                return Player.choose_random_doubles_move(battle)
+        if isinstance(action, (list, np.ndarray)) or hasattr(action, "__len__"):
+            a1, a2 = np.int64(action[0]), np.int64(action[1])
         else:
-            if isinstance(action, (list, np.ndarray)) or hasattr(action, "__len__"):
-                a1, a2 = np.int64(action[0]), np.int64(action[1])
-                print(a1, a2)
-            else:
-                # Normal calculation pathway for your standard integer scalars
-                npaction = np.int64(action)
-                a1, a2 = int(npaction // s), int(npaction % s)
-                print(npaction, a1, a2)
+            npaction = np.int64(action)
+            a1, a2 = int(npaction // s), int(npaction % s)
         if a1 == -2 and a2 == -2:
             return DefaultBattleOrder()
         elif a1 == -1 or a2 == -1:
             return ForfeitBattleOrder()
         try:
-            order1 = RLEnv._action_to_order_individual(a1, battle, fake, 0)
+            order1 = RLEnv_VGC._action_to_order_individual(a1, battle, fake, 0)
         except ValueError as e:
             if strict:
                 raise e
@@ -472,7 +429,7 @@ class RLEnv(DoublesEnv):
                     else order
                 )
         try:
-            order2 = RLEnv._action_to_order_individual(a2, battle, fake, 1)
+            order2 = RLEnv_VGC._action_to_order_individual(a2, battle, fake, 1)
         except ValueError as e:
             if strict:
                 raise e
@@ -636,7 +593,7 @@ async def train():
     os.makedirs(folder)
 
     num_envs = 2
-    env = RLEnv.create_env()
+    env = RLEnv_VGC.create_env()
     ppo = PPO(
         MaskedActorCriticPolicy,
         env,
@@ -654,7 +611,7 @@ async def train():
     env.close()
 
     # Testing/Evaluation
-    agent = RLPlayer(
+    agent = RLPlayerVGC(
         policy=ppo.policy,
         battle_format=BATTLE_FORMAT,
         max_concurrent_battles=75,
@@ -664,7 +621,13 @@ async def train():
 
     players = [agent] + [
         c(battle_format=BATTLE_FORMAT, max_concurrent_battles=25, team=TEAM)
-        for c in [SHP, RandomPlayer, MaxBasePowerPlayer, SimpleHeuristicsPlayer]
+        for c in [
+            RLPlayer,
+            SHP,
+            RandomPlayer,
+            MaxBasePowerPlayer,
+            SimpleHeuristicsPlayer,
+        ]
     ]
 
     cross_evaluation = await cross_evaluate(players, n_challenges=2500)
