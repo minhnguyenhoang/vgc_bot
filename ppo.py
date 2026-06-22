@@ -98,6 +98,7 @@ Timid Nature
 """
 
 
+# Actor policy. Used to determine the move pair for any given turn.
 class MaskedActorCriticPolicy(ActorCriticPolicy):
     def __init__(self, *args, **kwargs):
         super().__init__(
@@ -107,9 +108,6 @@ class MaskedActorCriticPolicy(ActorCriticPolicy):
             features_extractor_class=FeaturesExtractor,
         )
 
-    # -------------------------
-    # MAIN FIX
-    # -------------------------
     def _get_action_dist_from_latent(self, latent_pi):
         action_logits = self.action_net(latent_pi)
 
@@ -127,11 +125,12 @@ class MaskedActorCriticPolicy(ActorCriticPolicy):
         mask_p1 = mask[:, :N]
         mask_p2 = mask[:, N:]
 
-        # build joint mask via AND (your rule)
+        # build joint mask
         joint_mask = mask_p1[:, :, None] & mask_p2[:, None, :]
 
         invalid = torch.ones((N, N), device=logits.device, dtype=torch.int)
 
+        # building custom invalid masks
         invalid_ranges = [
             (27, 46),
             (47, 66),
@@ -139,11 +138,9 @@ class MaskedActorCriticPolicy(ActorCriticPolicy):
             (87, 106),
         ]
 
-        # Once-per-battle mechanics
         for l, r in invalid_ranges:
             invalid[l : r + 1, l : r + 1] = 0
 
-        # Invalid switching
         idx = torch.arange(1, 7, device=invalid.device)
         invalid[idx, idx] = 0
 
@@ -157,9 +154,6 @@ class MaskedActorCriticPolicy(ActorCriticPolicy):
 
         return self.action_dist.proba_distribution(logits)
 
-    # -------------------------
-    # ENSURE MASK IS AVAILABLE
-    # -------------------------
     def forward(self, obs, deterministic=False):
         self._mask = obs["action_mask"]
         actions, values, log_prob = super().forward(obs, deterministic)
@@ -182,7 +176,7 @@ class FeaturesExtractor(BaseFeaturesExtractor):
         return obs["observation"]
 
 
-class RLPlayer(Player):
+class RLPlayer(Player):  # sourced from poke-env, fixed to support 107x107 matrix
     policy: ActorCriticPolicy | None
 
     def __init__(
@@ -192,6 +186,8 @@ class RLPlayer(Player):
         self.policy = policy
 
     def teampreview(self, battle):
+        # Team preview function for simulation. Heuristics based
+        # Determines strongest pair and team from predefined teams
         # 1 = Incineroar, 2 = Sinistcha, 3 = Mega Floette, 4 = Garchomp, 5 = Mega Charizard Y, 6 = Venusaur
         teams = ["5614", "5624", "5612", "1324", "1326"]
 
@@ -249,13 +245,16 @@ class RLPlayer(Player):
                 ).unsqueeze(0),
             }
             action, _, _ = self.policy.forward(obs_dict)
+        # runs battle state through embedding, applies masking and policy and returns actions
         action = action.cpu().numpy()[0]
-        return RLEnv.action_to_order(action, battle, strict=False)
+        return RLEnv.action_to_order(
+            action, battle, strict=False
+        )  # sends actions to server
 
     @staticmethod
-    def embed_battle(battle: DoubleBattle):
-        moves_base_power = -np.ones(8)
-        moves_dmg_multiplier = np.ones(16)
+    def embed_battle(battle: DoubleBattle):  # battle environment representation
+        moves_base_power = -np.ones(8)  # base power of each move from ally pokemon
+        moves_dmg_multiplier = np.ones(16)  # damage multipliers against opponents
         for i, move in enumerate(battle.available_moves[0] + battle.available_moves[1]):
             moves_base_power[i] = move.base_power / 100
             if battle.opponent_active_pokemon[0] is not None:
@@ -270,17 +269,19 @@ class RLPlayer(Player):
                     battle.opponent_active_pokemon[1].type_2,
                     type_chart=GenData.from_gen(battle.gen).type_chart,
                 )
-        fainted_mon_team = len([mon for mon in battle.team.values() if mon.fainted]) / 4
+        fainted_mon_team = (
+            len([mon for mon in battle.team.values() if mon.fainted]) / 4
+        )  # number of fainted ally pokemon
         fainted_mon_opponent = (
             len([mon for mon in battle.opponent_team.values() if mon.fainted]) / 4
-        )
+        )  # number of fainted enemy pokemon
         our_hp = tuple(
             x.current_hp_fraction if x else 0.0 for x in battle.active_pokemon
-        )
+        )  # hp of ally team
         opp_hp = tuple(
             x.current_hp_fraction if x else 0.0 for x in battle.opponent_active_pokemon
-        )
-        can_mega = tuple(1 if x else 0 for x in battle.can_mega_evolve)
+        )  # hp of enemy team
+        can_mega = tuple(1 if x else 0 for x in battle.can_mega_evolve)  # mega
         return np.concatenate(
             [
                 moves_base_power,
@@ -301,7 +302,7 @@ class RLEnv(DoublesEnv):
             agent: Box(-5, 5, shape=(N_FEATURES,), dtype=np.float32)
             for agent in self.possible_agents
         }
-        self.action_spaces = {
+        self.action_spaces = {  # 107x107
             agent: Discrete(
                 DoublesEnv.get_action_space_size(GenData.from_format(BATTLE_FORMAT).gen)
                 ** 2
@@ -310,7 +311,7 @@ class RLEnv(DoublesEnv):
         }
 
     @classmethod
-    def create_env(cls) -> Monitor:
+    def create_env(cls) -> Monitor:  # training Gym environment
         env = cls(
             battle_format=BATTLE_FORMAT,
             log_level=25,
@@ -321,7 +322,9 @@ class RLEnv(DoublesEnv):
         opponent = SimpleHeuristicsPlayer(start_listening=False)
         return Monitor(SingleAgentWrapper(env, opponent))
 
-    def calc_reward(self, battle) -> float:
+    def calc_reward(
+        self, battle
+    ) -> float:  # rewards for battles. refer to documentation
         return self.reward_computing_helper(
             battle,
             fainted_value=2.0,
@@ -334,7 +337,7 @@ class RLEnv(DoublesEnv):
         return RLPlayer.embed_battle(battle)
 
     @staticmethod
-    def action_to_order(
+    def action_to_order(  # sourced from poke-env, fixed to support 107x107 matrix
         action: int,
         battle: DoubleBattle,
         fake: bool = False,
@@ -394,7 +397,7 @@ class RLEnv(DoublesEnv):
             return joined_orders[0]
 
     @staticmethod
-    def _action_to_order_individual(
+    def _action_to_order_individual(  # sourced from poke-env, fixed to support 107x107 matrix
         action: np.int64, battle: DoubleBattle, fake: bool, pos: int
     ) -> SingleBattleOrder:
         if action == -2:
@@ -443,7 +446,7 @@ class RLEnv(DoublesEnv):
         return order
 
     @staticmethod
-    def order_to_action(
+    def order_to_action(  # sourced from poke-env, fixed to support 107x107 matrix
         order: BattleOrder,
         battle: DoubleBattle,
         fake: bool = False,

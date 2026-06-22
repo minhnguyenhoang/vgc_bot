@@ -107,6 +107,7 @@ Timid Nature
 random.seed(42)
 
 
+# Actor policy. Used to determine the move pair for any given turn.
 class MaskedActorCriticPolicy_VGC(ActorCriticPolicy):
     def __init__(self, *args, **kwargs):
         super().__init__(
@@ -116,9 +117,6 @@ class MaskedActorCriticPolicy_VGC(ActorCriticPolicy):
             features_extractor_class=FeaturesExtractor,
         )
 
-    # -------------------------
-    # MAIN FIX
-    # -------------------------
     def _get_action_dist_from_latent(self, latent_pi):
         action_logits = self.action_net(latent_pi)
 
@@ -136,11 +134,12 @@ class MaskedActorCriticPolicy_VGC(ActorCriticPolicy):
         mask_p1 = mask[:, :N]
         mask_p2 = mask[:, N:]
 
-        # build joint mask via AND (your rule)
+        # build joint mask
         joint_mask = mask_p1[:, :, None] & mask_p2[:, None, :]
 
         invalid = torch.ones((N, N), device=logits.device, dtype=torch.int)
 
+        # building custom invalid masks
         invalid_ranges = [
             (27, 46),
             (47, 66),
@@ -148,11 +147,9 @@ class MaskedActorCriticPolicy_VGC(ActorCriticPolicy):
             (87, 106),
         ]
 
-        # Once-per-battle mechanics
         for l, r in invalid_ranges:
             invalid[l : r + 1, l : r + 1] = 0
 
-        # Invalid switching
         idx = torch.arange(1, 7, device=invalid.device)
         invalid[idx, idx] = 0
 
@@ -187,7 +184,7 @@ class FeaturesExtractor(BaseFeaturesExtractor):
         return obs["observation"]
 
 
-class RLPlayerVGC(Player):
+class RLPlayerVGC(Player):  # sourced from poke-env, fixed to support 107x107 matrix
     policy: ActorCriticPolicy | None
 
     def __init__(
@@ -196,7 +193,7 @@ class RLPlayerVGC(Player):
         super().__init__(*args, **kwargs)
         self.policy = policy
 
-    def teampreview(self, battle):
+    def teampreview(self, battle):  # see replica function below for explanation
         # 1 = Incineroar, 2 = Sinistcha, 3 = Mega Floette, 4 = Garchomp, 5 = Mega Charizard Y, 6 = Venusaur
         teams = ["5614", "5624", "5612", "1324", "1326"]
 
@@ -254,13 +251,16 @@ class RLPlayerVGC(Player):
                 ).unsqueeze(0),
             }
             action, _, _ = self.policy.forward(obs_dict)
+        # runs battle state through embedding, applies masking and policy and returns actions
         action = action.cpu().numpy()[0]
-        return RLEnv_VGC.action_to_order(action, battle, strict=False)
+        return RLEnv_VGC.action_to_order(
+            action, battle, strict=False
+        )  # sends actions to server
 
     @staticmethod
-    def embed_battle(battle: DoubleBattle):
-        moves_base_power = -np.ones(8)
-        moves_dmg_multiplier = np.ones(16)
+    def embed_battle(battle: DoubleBattle):  # battle environment representation
+        moves_base_power = -np.ones(8)  # base power of each move from ally pokemon
+        moves_dmg_multiplier = np.ones(16)  # damage multipliers against opponents
         for i, move in enumerate(battle.available_moves[0] + battle.available_moves[1]):
             moves_base_power[i] = move.base_power / 100
             if battle.opponent_active_pokemon[0] is not None:
@@ -275,17 +275,21 @@ class RLPlayerVGC(Player):
                     battle.opponent_active_pokemon[1].type_2,
                     type_chart=GenData.from_gen(battle.gen).type_chart,
                 )
-        fainted_mon_team = len([mon for mon in battle.team.values() if mon.fainted]) / 4
+        fainted_mon_team = (
+            len([mon for mon in battle.team.values() if mon.fainted]) / 4
+        )  # number of fainted ally pokemon
         fainted_mon_opponent = (
             len([mon for mon in battle.opponent_team.values() if mon.fainted]) / 4
-        )
+        )  # number of fainted enemy pokemon
         our_hp = tuple(
             x.current_hp_fraction if x else 0.0 for x in battle.active_pokemon
-        )
+        )  # hp of ally team
         opp_hp = tuple(
             x.current_hp_fraction if x else 0.0 for x in battle.opponent_active_pokemon
-        )
-        can_mega = tuple(1 if x else 0 for x in battle.can_mega_evolve)
+        )  # hp of enemy team
+        can_mega = tuple(
+            1 if x else 0 for x in battle.can_mega_evolve
+        )  # mega availability
         return np.concatenate(
             [
                 moves_base_power,
@@ -301,14 +305,16 @@ class RLPlayerVGC(Player):
 
 class RLEnv_VGC(DoublesEnv):
     def __init__(self, **kwargs):
-        self._choose_on_teampreview = False
+        self._choose_on_teampreview = (
+            False  # enables random team preview to increase training variety
+        )
         self.choose_on_teampreview = False
         super().__init__(**kwargs)
         self.observation_spaces = {
             agent: Box(-5, 5, shape=(N_FEATURES,), dtype=np.float32)
             for agent in self.possible_agents
         }
-        self.action_spaces = {
+        self.action_spaces = {  # defining 107x107 matrix action space
             agent: Discrete(
                 DoublesEnv.get_action_space_size(GenData.from_format(BATTLE_FORMAT).gen)
                 ** 2
@@ -317,7 +323,7 @@ class RLEnv_VGC(DoublesEnv):
         }
 
     @classmethod
-    def create_env(cls) -> Monitor:
+    def create_env(cls) -> Monitor:  # creating training env
         env = cls(
             battle_format=BATTLE_FORMAT,
             log_level=25,
@@ -328,7 +334,9 @@ class RLEnv_VGC(DoublesEnv):
         opponent = SimpleHeuristicsPlayer(start_listening=False)
         return Monitor(SingleAgentWrapper(env, opponent))
 
-    def calc_reward(self, battle) -> float:
+    def calc_reward(
+        self, battle
+    ) -> float:  # rewards for battles. refer to documentation
         return self.reward_computing_helper(
             battle,
             fainted_value=5.0,
@@ -342,7 +350,13 @@ class RLEnv_VGC(DoublesEnv):
 
     def teampreview(self, battle):
         # 1 = Incineroar, 2 = Sinistcha, 3 = Mega Floette, 4 = Garchomp, 5 = Mega Charizard Y, 6 = Venusaur
-        teams = ["5614", "5624", "5612", "1324", "1326"]
+        teams = [
+            "5614",
+            "5624",
+            "5612",
+            "1324",
+            "1326",
+        ]  # list of predefined teams to pick from
 
         def teampreview_performance(mon_a, mon_b):
             a_on_b = b_on_a = -np.inf
@@ -369,6 +383,8 @@ class RLEnv_VGC(DoublesEnv):
         ]
         opponent_team_perms = list(combinations(battle.opponent_team.values(), 4))
 
+        # Heuristic function for team preview. Evaluates strongest leading pair and team of 4
+
         score = {x: 0 for x in battle.team.values()}
         for mon in battle.team.values():
             perf = []
@@ -384,17 +400,21 @@ class RLEnv_VGC(DoublesEnv):
         return "/team " + teams[team_perms.index(avg_score[-1][1])]
 
     @staticmethod
-    def action_to_order(
+    def action_to_order(  # sourced from poke-env, fixed to support 107x107 matrix
         action,
         battle: DoubleBattle,
         fake: bool = False,
         strict: bool = False,
     ) -> BattleOrder:
+        # custom code. This allows for proper training and also transitioning into 107x107 matrix representation
         strict = False
         s = DoublesEnv.get_action_space_size(GenData.from_format(BATTLE_FORMAT).gen)
 
         if isinstance(action, (list, np.ndarray)) or hasattr(action, "__len__"):
-            a1, a2 = np.int64(action[0]), np.int64(action[1])
+            a1, a2 = (
+                np.int64(action[0]),
+                np.int64(action[1]),
+            )  # safeguard against improper implementation
         else:
             npaction = np.int64(action)
             a1, a2 = int(npaction // s), int(npaction % s)
@@ -444,10 +464,10 @@ class RLEnv_VGC(DoublesEnv):
                     battle.logger.warning(error_msg + " Defaulting to random move.")
                 return Player.choose_random_doubles_move(battle)
         else:
-            return joined_orders[0]
+            return joined_orders[0]  # making order to server
 
     @staticmethod
-    def _action_to_order_individual(
+    def _action_to_order_individual(  # sourced from poke-env, fixed to support 107x107 matrix
         action: np.int64, battle: DoubleBattle, fake: bool, pos: int
     ) -> SingleBattleOrder:
         action = np.int64(action)
@@ -480,7 +500,7 @@ class RLEnv_VGC(DoublesEnv):
                     f"specifies a move but the move index {(action - 7) % 20 // 5} "
                     f"is out of bounds for available moves {mvs}!"
                 )
-            order = Player.create_order(
+            order = Player.create_order(  # player move decoding
                 mvs[(action - 7) % 20 // 5],
                 move_target=(action.item() - 7) % 5 - 2,
                 mega=(action - 7) // 20 == 1,
@@ -497,7 +517,7 @@ class RLEnv_VGC(DoublesEnv):
         return order
 
     @staticmethod
-    def order_to_action(
+    def order_to_action(  # sourced from poke-env, fixed to support 107x107 matrix
         order: BattleOrder,
         battle: DoubleBattle,
         fake: bool = False,
@@ -575,6 +595,7 @@ class RLEnv_VGC(DoublesEnv):
 
 
 async def train():
+    # saving replays
     folder = "replays/RL_Training_VGC"
     if os.path.exists(folder):
         shutil.rmtree(folder)
@@ -587,6 +608,7 @@ async def train():
     await asyncio.sleep(2)
     gc.collect()
 
+    # benchmarking
     num_envs = 2
     env = RLEnv_VGC.create_env()
     ppo = PPO(
@@ -600,10 +622,11 @@ async def train():
         device="cpu",
     )
 
+    # collecting gc after training
     await asyncio.sleep(2)
     gc.collect()
 
-    # Training
+    # training
     print("Training...")
     ppo.learn(98_304, progress_bar=True)
     ppo.save("ppo_vgc_model")
@@ -612,7 +635,7 @@ async def train():
     await asyncio.sleep(2)
     gc.collect()
 
-    # Testing/Evaluation
+    # eval
     agent = RLPlayerVGC(
         policy=ppo.policy,
         battle_format=BATTLE_FORMAT,
