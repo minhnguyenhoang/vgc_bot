@@ -10,6 +10,7 @@ test.py
 pokemon-showdown/
 replays/
 results/
+*.tar.gz
 
 # Virtual environments
 .venv
